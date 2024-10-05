@@ -664,7 +664,7 @@ async def confirm_request(update: Update, context: CallbackContext):
                 f"📅 Период: {period_range}\n"
                 f"💸 Коэффициент: {user_data.get('acceptance_coefficient', 'Не выбран')}\n\n"
                 f"ID заявки: {request_id}\n\n"
-                "Оплата уже была произведена ранее, заявка подтверждена."
+                "Поиск лимитов активирован ✅."
             )
             keyboardline = [
                 [InlineKeyboardButton("Главное меню", callback_data='main_menu')],
@@ -869,11 +869,11 @@ async def compare_limits(update: Update, context: CallbackContext, limits_data):
     # Отправляем уведомления
     for limit in filtered_limits:
         message = (
-            f"Лимит найден!\n"
-            f"Склад: {limit['warehouseName']}\n"
-            f"Тип приемки: {limit['boxTypeName']}\n"
-            f"Коэффициент: {limit['coefficient']}\n"
-            f"Дата: {limit['date']}"
+            f"Лимит найден! ✅\n"
+            f"🏦 Склад: {limit['warehouseName']}\n"
+            f"📦 Тип приемки: {limit['boxTypeName']}\n"
+            f"💸 Коэффициент: {limit['coefficient']}\n"
+            f"📅Дата: {limit['date']}"
         )
         await update.callback_query.message.reply_text(message)
 
