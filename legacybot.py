@@ -39,12 +39,12 @@ async def save_user(connection, telegram_username, phone_number):
 
 
 
-async def save_request(connection, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo):
+async def save_request(connection, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, warehouse_ids, date_period):  # Добавляем warehouse_ids
     query = """
-    INSERT INTO requests (request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo)
-    VALUES ($1, $2, $3, $4, $5, $6, $7);
+    INSERT INTO requests (request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, warehouse_ids, date_period)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
     """
-    await connection.execute(query, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo)
+    await connection.execute(query, request_id, user_id, warehouses, delivery_type, request_date, coefficient, photo, warehouse_ids, date_period)
 
 
 def format_date(date_obj):
@@ -411,7 +411,9 @@ async def get_request_from_db(connection, request_id):
         'warehouses': warehouses,
         'delivery_type': result['delivery_type'],
         'date_period': result['request_date'],  # или другое поле, если дата хранится иначе
-        'acceptance_coefficient': result['coefficient']
+        'acceptance_coefficient': result['coefficient'],
+        'warehouse_ids': result['warehouse_ids'],  # Добавляем warehouse_ids
+        'date_period': result['date_period']  # Добавляем date_period
     }
 
     return request_data
@@ -649,25 +651,14 @@ async def confirm_request(update: Update, context: CallbackContext):
     
     try:
         connection = await init_db()
+        warehouse_ids = [str(wh[5]) for wh in warehouses_data if wh[1] in user_data.get('warehouses', {}).values()]
+        warehouse_ids_str = ','.join(warehouse_ids)
 
         has_paid = await check_payment(connection, user_id)
-
-        warehouse_nums = list(user_data.get('warehouses', {}).keys()) 
-        warehouse_names = [wh[1] for wh in warehouses_data if wh[1] in warehouse_nums]
-        # Проверяем, что список складов не пустой 
-        if not warehouse_nums:
-            await update.callback_query.edit_message_text("Ошибка: список складов пуст.")
-            return
-
-        # Дополнительная проверка на наличие складов в warehouses_data
-        if not warehouse_names:
-            await update.callback_query.edit_message_text("Ошибка: выбранные склады не найдены в базе данных.")
-            return
-
-        warehouses = ', '.join(warehouse_names)
         
         # Если пользователь ранее уже оплатил
         if has_paid:
+
             warehouses = ', '.join(list(user_data.get('warehouses', {}).values()))
             message = (
                 "Заявка успешно создана:\n"
@@ -684,6 +675,8 @@ async def confirm_request(update: Update, context: CallbackContext):
             reply_markup = InlineKeyboardMarkup(keyboardline)
 
             await update.callback_query.edit_message_text(message, reply_markup=reply_markup)
+
+
             await save_request(
                 connection,
                 int(request_id),
@@ -693,17 +686,30 @@ async def confirm_request(update: Update, context: CallbackContext):
                 datetime.now().date(),
                 user_data.get('acceptance_coefficient', 0),
                 None,
+                warehouse_ids_str,  # Передаем список ID складов
+                user_data.get('date_period')  # Передаем выбранную дату
             )
 
-            warehouse_ids = [str(wh[5]) for wh in warehouses_data if wh[1] in user_data.get('warehouses', {}).values()] 
-            warehouse_ids_str = ",".join(warehouse_ids)
 
-            context.user_data['request']['warehouse_ids'] = warehouse_ids  
+            context.user_data['request']['warehouse_ids'] = warehouse_ids
             asyncio.create_task(search_limits_task(update, context, warehouse_ids))
 
             await connection.close()
             return        
+        
+        warehouse_nums = list(user_data.get('warehouses', {}).keys()) 
+        warehouse_names = [wh[1] for wh in warehouses_data if wh[1] in warehouse_nums]
+        # Проверяем, что список складов не пустой 
+        if not warehouse_nums:
+            await update.callback_query.edit_message_text("Ошибка: список складов пуст.")
+            return
 
+        # Дополнительная проверка на наличие складов в warehouses_data
+        if not warehouse_names:
+            await update.callback_query.edit_message_text("Ошибка: выбранные склады не найдены в базе данных.")
+            return
+
+        warehouses = ', '.join(warehouse_names)
 
         # Сохранение заявки с is_paid=False
         await save_request(
@@ -715,6 +721,8 @@ async def confirm_request(update: Update, context: CallbackContext):
             datetime.now().date(),
             user_data.get('acceptance_coefficient', 0),
             None,
+            warehouse_ids_str,  # Передаем список ID складов
+            user_data.get('date_period')  # Передаем выбранную дату
         )
 
     except Exception as e:
@@ -749,11 +757,52 @@ async def confirm_request(update: Update, context: CallbackContext):
     context.user_data['awaiting_receipt'] = True
     context.user_data['request']['warehouse_ids'] = warehouse_ids
 
-
     asyncio.create_task(search_limits_task(update, context, warehouse_ids))
 
     await connection.close()
 
+
+async def start_limits_search_tasks(application):
+    """
+    Запускает задачи для поиска лимитов при запуске бота.
+    """
+    try:
+        connection = await init_db()
+        # Загружаем все запросы из базы данных
+        query = "SELECT request_id FROM requests"  # Получаем только ID запросов
+        requests_ids = await connection.fetch(query)
+
+        for request in requests_ids:
+            request_id = request['request_id']  # Извлекаем ID запроса
+
+            # Получаем данные запроса из базы данных
+            request_data = await get_request_from_db(connection, request_id)
+
+            # Проверяем наличие данных
+            if not all(value for value in request_data.values() if value is not None):
+                logging.warning(f"Пропущен запрос из базы данных: {request_data} - не все данные доступны")
+                continue  # Пропускаем этот запрос
+
+            # Создаем фиктивный update и context
+            update = Update(0, 0, None)  # Создаем update без лишних аргументов
+            context = CallbackContext(application)
+            context.user_data['request'] = request_data  # Добавляем данные запроса в context.user_data
+
+            # Извлекаем warehouse_ids из request_data
+            warehouse_ids = context.user_data['request'].get('warehouse_ids')
+            if warehouse_ids is None:
+                logging.warning(f"Пропущен запрос из базы данных: {request_data} - не найдены warehouse_ids")
+                continue  # Пропускаем этот запрос
+
+            warehouse_ids_list = [int(x) for x in warehouse_ids.split(',') if x]
+
+            asyncio.create_task(search_limits_task(update, context, warehouse_ids_list))
+
+    except Exception as e:
+        logging.error(f"Ошибка при запуске задач поиска лимитов: {e}")
+    finally:
+        if connection:
+            await connection.close()
 
 async def search_limits_task(update: Update, context: CallbackContext, warehouse_ids):
     """
@@ -925,7 +974,7 @@ async def main_menu(update: Update, context: CallbackContext):
 
 
 def main():
-    application = Application.builder().token("7345975983:AAGMqp0ecosKAS9KENy4MbsHpT2cO3KOY7g").build()
+    application = Application.builder().token("7588760839:AAFQNSlWVM2TA1rXLWCQ3ZsNqAX4dwxvUKM").build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(add_request, pattern='^add_request$'))
@@ -947,6 +996,12 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_replace_warehouse, pattern=r'replace_\d+'))
     application.add_handler(CallbackQueryHandler(region_selected, pattern=r'region_.*'))
 
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Запускаем задачи для поиска лимитов при запуске бота
+    loop.create_task(start_limits_search_tasks(application))
 
     application.run_polling()
 
