@@ -652,7 +652,19 @@ async def confirm_request(update: Update, context: CallbackContext):
 
         has_paid = await check_payment(connection, user_id)
 
-        
+        warehouse_nums = list(user_data.get('warehouses', {}).keys()) 
+        warehouse_names = [wh[1] for wh in warehouses_data if wh[1] in warehouse_nums]
+        # Проверяем, что список складов не пустой 
+        if not warehouse_nums:
+            await update.callback_query.edit_message_text("Ошибка: список складов пуст.")
+            return
+
+        # Дополнительная проверка на наличие складов в warehouses_data
+        if not warehouse_names:
+            await update.callback_query.edit_message_text("Ошибка: выбранные склады не найдены в базе данных.")
+            return
+
+        warehouses = ', '.join(warehouse_names)
         
         # Если пользователь ранее уже оплатил
         if has_paid:
@@ -692,24 +704,6 @@ async def confirm_request(update: Update, context: CallbackContext):
             await connection.close()
             return        
 
-        warehouse_nums = list(user_data.get('warehouses', {}).keys()) 
-
-        # Проверяем, что список складов не пустой 
-        if not warehouse_nums:
-            await update.callback_query.edit_message_text("Ошибка: список складов пуст.")
-            return
-
-        # Получаем названия складов по их ID
-        warehouse_names = [wh[1] for wh in warehouses_data if wh[0] in warehouse_nums]
-        
-        # Дополнительная проверка на наличие складов в warehouses_data
-        if not warehouse_names:
-            await update.callback_query.edit_message_text("Ошибка: выбранные склады не найдены в базе данных.")
-            return
-
-        warehouses = ', '.join(warehouse_names)
-
-        
 
         # Сохранение заявки с is_paid=False
         await save_request(
@@ -792,6 +786,7 @@ async def search_limits_task(update: Update, context: CallbackContext, warehouse
             limits_data = await get_limits(warehouse_ids)  
             if limits_data:
                 await compare_limits(update, context, limits_data)
+                break  # Выходим из цикла после отправки уведомления
             else:
                 print("Ошибка получения лимитов. Повторная попытка через 60 секунд.")  # Добавлен вывод сообщения
             await asyncio.sleep(60) 
@@ -850,7 +845,7 @@ async def compare_limits(update: Update, context: CallbackContext, limits_data):
             wh = warehouses_by_id[warehouse_id]
 
             # Проверяем склады и коэффициент приемки
-            if wh[1] in selected_warehouses and coefficient >= acceptance_coefficient:
+            if wh[1] in selected_warehouses and coefficient <= acceptance_coefficient and not -1:
 
                 # Если тип доставки - 'QR поставка коробами', сравниваем по имени
                 if delivery_type == 'delivery_qr_box':
