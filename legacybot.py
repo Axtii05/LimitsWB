@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 import logging
 import asyncio
 import aiohttp
+from telegram.ext import JobQueue
+from telegram import Chat ,User
 
 
 # Функция для инициализации подключения к базе данных PostgreSQL
@@ -399,12 +401,18 @@ async def get_request_from_db(connection, request_id):
     if result is None:
         raise ValueError(f"Запрос с ID {request_id} не найден в базе данных.")
 
-    # TODO: Уточнить, как именно хранятся данные о складах в базе данных
-    # Предположим, что warehouses - это массив строк вида "ID_склада - название_склада"
     warehouses = {}
     for wh_data in result['warehouses']:
-        wh_id, wh_name = wh_data.split(' - ', 1)  # Разделяем строку на ID и название
-        warehouses[int(wh_id)] = wh_name 
+        if ' - ' in wh_data:
+            try:
+                wh_id, wh_name = wh_data.split(' - ', 1)  # Разделяем строку на ID и название
+                warehouses[int(wh_id)] = wh_name
+            except ValueError:
+                logging.error(f"Ошибка при распаковке данных склада: {wh_data}")
+                continue  # Пропускаем некорректные данные
+        else:
+            logging.warning(f"Неверный формат данных склада: {wh_data}")
+            continue  # Пропускаем данные с неверным форматом
 
     # Преобразуем данные из базы данных в формат, совместимый с context.user_data['request']
     request_data = {
@@ -417,6 +425,7 @@ async def get_request_from_db(connection, request_id):
     }
 
     return request_data
+
 
 
 async def save_request_changes(connection, request_id, updated_data):
@@ -632,7 +641,6 @@ async def confirm_request(update: Update, context: CallbackContext):
     user_data = context.user_data.get('request', {})
     user_id = context.user_data.get('user_id') 
 
-    # Проверяем, что данные заявки существуют
     if not user_data:
         await update.callback_query.edit_message_text("Ошибка: данные заявки отсутствуют.")
         return
@@ -644,14 +652,15 @@ async def confirm_request(update: Update, context: CallbackContext):
     date_period = user_data.get('date_period', 'Не выбран')
     period_range = get_period_range(date_period)
 
-    telegram_username = update.effective_user.username
-    phone_number = None
-
-    
-    
     try:
         connection = await init_db()
-        warehouse_ids = [str(wh[5]) for wh in warehouses_data if wh[1] in user_data.get('warehouses', {}).values()]
+        
+        # Формируем корректный список warehouse_ids
+        warehouse_ids = [str(wh[5]) for wh in warehouses_data if wh[1] in user_data.get('warehouses', {}).values() and wh[5]]
+        
+        # Логируем warehouse_ids для проверки
+        print(f"Сформированные warehouse_ids: {warehouse_ids}")  # Ожидаем список полных ID складов
+        
         warehouse_ids_str = ','.join(warehouse_ids)
 
         has_paid = await check_payment(connection, user_id)
@@ -692,7 +701,7 @@ async def confirm_request(update: Update, context: CallbackContext):
 
 
             context.user_data['request']['warehouse_ids'] = warehouse_ids
-            asyncio.create_task(search_limits_task(update, context, warehouse_ids))
+            asyncio.create_task(search_limits_job(context))
 
             await connection.close()
             return        
@@ -757,170 +766,176 @@ async def confirm_request(update: Update, context: CallbackContext):
     context.user_data['awaiting_receipt'] = True
     context.user_data['request']['warehouse_ids'] = warehouse_ids
 
-    asyncio.create_task(search_limits_task(update, context, warehouse_ids))
+    asyncio.create_task(search_limits_job(context))
 
     await connection.close()
 
 
-async def start_limits_search_tasks(application):
+async def search_limits_job(context: CallbackContext):
     """
-    Запускает задачи для поиска лимитов при запуске бота.
+    Функция для поиска лимитов, которая будет выполняться как фоновая задача.
     """
     try:
-        connection = await init_db()
+        if not hasattr(context, 'job') or not context.job or not context.job.data:
+            logging.error("context.job или context.job.data не существует")
+            return
+
+
+        # Получаем данные запроса из context.job.data
+        request_data = context.job.data
+        warehouse_ids = request_data['warehouse_ids']
+        delivery_type_id = request_data['delivery_type_id']
+        acceptance_coefficient = int(request_data.get('acceptance_coefficient', 0))
+        delivery_type = request_data['delivery_type']
+        user_id = request_data['user_id']
+        selected_warehouses = request_data['warehouses']
+
+        # Создаем словарь для быстрого поиска склада по ID
+        warehouses_by_id = {wh[5]: wh for wh in warehouses_data}
+
+        date_period = request_data['date_period']
+        end_date = datetime.now() + timedelta(days=30)  # по умолчанию ищем месяц
+        if date_period == 'today':
+            end_date = datetime.now() + timedelta(days=1)
+        elif date_period == 'tomorrow':
+            end_date = datetime.now() + timedelta(days=2)
+        elif date_period == 'week':
+            end_date = datetime.now() + timedelta(weeks=1)
+
+        while datetime.now() < end_date:
+            limits_data = await get_limits(warehouse_ids)
+            if limits_data:
+                filtered_limits = []
+                for limit in limits_data:
+                    try:
+                        warehouse_id = limit['warehouseID']
+                        coefficient = limit['coefficient']
+                        box_type_id = limit.get('boxTypeID')
+
+                        if warehouse_id not in warehouses_by_id:
+                            continue
+
+                        wh = warehouses_by_id[warehouse_id]
+                        if wh[1] in selected_warehouses and coefficient <= acceptance_coefficient:
+                            if delivery_type == 'delivery_qr_box':
+                                if limit['boxTypeName'] == 'QR поставка коробами':
+                                    filtered_limits.append(limit)
+                            elif box_type_id is not None and delivery_type_id == box_type_id:
+                                filtered_limits.append(limit)
+
+                    except KeyError as e:
+                        logging.error(f"Ошибка: отсутствует ключ {e} в данных лимита")
+
+                filtered_limits = sorted(filtered_limits, key=lambda x: x['coefficient'], reverse=True)
+
+                for limit in filtered_limits:
+                    message = (
+                        f"Лимит найден! ✅\n"
+                        f"🏦 Склад: {limit['warehouseName']}\n"
+                        f"📦 Тип приемки: {limit['boxTypeName']}\n"
+                        f"💸 Коэффициент: {limit['coefficient']}\n"
+                        f"📅Дата: {limit['date']}"
+                    )
+                    # Отправка сообщения пользователю
+                    await context.bot.send_message(chat_id=user_id, text=message)
+                break
+            else:
+                print("Ошибка получения лимитов. Повторная попытка через 60 секунд.")
+            await asyncio.sleep(60)
+
+    except Exception as e:
+        logging.error(f"Ошибка при поиске лимитов: {e}")
+
+async def start_limits_search_tasks(application: Application):
+    """
+    Запускает фоновые задачи для поиска лимитов при запуске бота.
+    """
+    conn = None
+    try:
+        conn = await init_db()
+        logging.info("Успешно подключились к базе данных.")
+        job_queue: JobQueue = application.job_queue  # Получаем объект JobQueue
+
         # Загружаем все запросы из базы данных
-        query = "SELECT request_id FROM requests"  # Получаем только ID запросов
-        requests_ids = await connection.fetch(query)
+        query = """
+        SELECT 
+            r.request_id, r.warehouse_ids, r.delivery_type, r.coefficient, r.date_period, r.user_id 
+        FROM requests r
+        """
+        requests_data = await conn.fetch(query)
 
-        for request in requests_ids:
-            request_id = request['request_id']  # Извлекаем ID запроса
+        for request in requests_data:
+            warehouse_ids = request['warehouse_ids'].split(',')  # Разделяем строку на список
+            print(f"Извлеченные warehouse_ids: {warehouse_ids}")
+        if not requests_data:
+            logging.warning("Нет запросов в базе данных.")
+            return
 
-            # Получаем данные запроса из базы данных
-            request_data = await get_request_from_db(connection, request_id)
+        for request in requests_data:
+            request_id = request['request_id']
+            warehouse_ids = request['warehouse_ids']
+            delivery_type = request['delivery_type']
+            acceptance_coefficient = request['coefficient']
+            date_period = request['date_period']
+            user_id = request['user_id']
 
-            # Проверяем наличие данных
-            if not all(value for value in request_data.values() if value is not None):
-                logging.warning(f"Пропущен запрос из базы данных: {request_data} - не все данные доступны")
-                continue  # Пропускаем этот запрос
+            if not warehouse_ids or not user_id:
+                logging.warning(f"Пропущен запрос из-за отсутствия warehouse_ids или user_id: {request}")
+                continue
 
-            # Создаем фиктивный update и context
-            update = Update(0, 0, None)  # Создаем update без лишних аргументов
-            context = CallbackContext(application)
-            context.user_data['request'] = request_data  # Добавляем данные запроса в context.user_data
+            # Создаем данные для фоновой задачи
+            job_data = {
+                'request_id': request_id,
+                'warehouse_ids': warehouse_ids,
+                'warehouses': {wh[1]: wh[1] for wh in warehouses_data if str(wh[5]) in warehouse_ids.split(',')},
+                'delivery_type': delivery_type,
+                'delivery_type_id': int(delivery_type.split('_')[-1]) if '_' in delivery_type else None,
+                'acceptance_coefficient': acceptance_coefficient,
+                'date_period': date_period,
+                'user_id': user_id
+            }
 
-            # Извлекаем warehouse_ids из request_data
-            warehouse_ids = context.user_data['request'].get('warehouse_ids')
-            if warehouse_ids is None:
-                logging.warning(f"Пропущен запрос из базы данных: {request_data} - не найдены warehouse_ids")
-                continue  # Пропускаем этот запрос
+            logging.info(f"Добавляем задачу с данными: {job_data}")
 
-            warehouse_ids_list = [int(x) for x in warehouse_ids.split(',') if x]
-
-            asyncio.create_task(search_limits_task(update, context, warehouse_ids_list))
+            # Добавляем фоновую задачу в очередь
+            job_queue.run_repeating(search_limits_job, interval=90, first=0, data=job_data)
 
     except Exception as e:
         logging.error(f"Ошибка при запуске задач поиска лимитов: {e}")
     finally:
-        if connection:
-            await connection.close()
+        if conn:
+            await conn.close()
+            logging.info("Подключение к базе данных закрыто.")
 
-async def search_limits_task(update: Update, context: CallbackContext, warehouse_ids):
-    """
-    Функция для запуска поиска лимитов в отдельной задаче.
-    """
-    user_data = context.user_data
-
-    if 'request' not in user_data or 'warehouse_ids' not in user_data['request']:
-        logging.error("Ошибка: 'warehouse_ids' не найден в context.user_data['request']")
-        return
-
-    warehouse_ids = context.user_data['request']['warehouse_ids'] 
-    
-    # Проверка на существование 'request'
-    if 'request' not in user_data:
-        logging.error("Ошибка: 'request' не найден в context.user_data")
-        return  # Прерываем функцию, если 'request' не найден
-
-    date_period = user_data['request'].get('date_period')  # Изменено
-    end_date = datetime.now() + timedelta(days=30)  # по умолчанию ищем месяц
-    if date_period == 'today':
-        end_date = datetime.now() + timedelta(days=1)
-    elif date_period == 'tomorrow':
-        end_date = datetime.now() + timedelta(days=2)  # Исправлено
-    elif date_period == 'week':
-        end_date = datetime.now() + timedelta(weeks=1)
-
-    while datetime.now() < end_date:
-        try:
-            limits_data = await get_limits(warehouse_ids)  
-            if limits_data:
-                await compare_limits(update, context, limits_data)
-                break  # Выходим из цикла после отправки уведомления
-            else:
-                print("Ошибка получения лимитов. Повторная попытка через 60 секунд.")  # Добавлен вывод сообщения
-            await asyncio.sleep(60) 
-        except Exception as e:
-            logging.error(f"Ошибка при поиске лимитов: {e}")
-            break
-
-
-async def get_limits(warehouse_ids):
+async def get_limits(warehouse_ids_str):
     """
     Функция для получения данных о лимитах с API Wildberries.
     """
+
     url = "https://supplies-api.wildberries.ru/api/v1/acceptance/coefficients"
     headers = {
-        "Authorization": "Bearer eyJhbGciOiJFUzI1NiIsImtpZCI6IjIwMjQwOTA0djEiLCJ0eXAiOiJKV1QifQ.eyJlbnQiOjEsImV4cCI6MTc0MjI2NjM5NSwiaWQiOiIwMTkxZmI1Mi1kNGUzLTc3MTAtOWM0MC00ZjVmYmM4MGIzYzYiLCJpaWQiOjQ1MTYxMTc0LCJvaWQiOjMxNjA1NSwicyI6MTA1Niwic2lkIjoiNmU3MTI1NDUtMjRlOC00MWJmLWI0MTktN2ZjOTI1Y2NmYTE0IiwidCI6ZmFsc2UsInVpZCI6NDUxNjExNzR9.c4nF0zK4egZTrp7MZPILKGHBxgWY-KNZ0jDmW4HLCymM68HcjlaRlUFBid4bxwyfSt9eMqiGTTIkB7L6TFqsjA"  # Замените <your_token> на ваш токен
+        "Authorization": "Bearer eyJhbGciOiJFUzI1NiIsImtpZCI6IjIwMjQwOTA0djEiLCJ0eXAiOiJKV1QifQ.eyJlbnQiOjEsImV4cCI6MTc0MjI2NjM5NSwiaWQiOiIwMTkxZmI1Mi1kNGUzLTc3MTAtOWM0MC00ZjVmYmM4MGIzYzYiLCJpaWQiOjQ1MTYxMTc0LCJvaWQiOjMxNjA1NSwicyI6MTA1Niwic2lkIjoiNmU3MTI1NDUtMjRlOC00MWJmLWI0MTktN2ZjOTI1Y2NmYTE0IiwidCI6ZmFsc2UsInVpZCI6NDUxNjExNzR9.c4nF0zK4egZTrp7MZPILKGHBxgWY-KNZ0jDmW4HLCymM68HcjlaRlUFBid4bxwyfSt9eMqiGTTIkB7L6TFqsjA"  # Ваш актуальный токен
     }
-    warehouse_ids_str = ",".join(str(wh_id) for wh_id in warehouse_ids)
+
+
     params = {
         "warehouseIDs": warehouse_ids_str
     }
+
+    # Логируем параметры запроса перед отправкой
+    logging.info(f"Отправляем запрос с параметрами: {params}")
+
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers, params=params) as response:
             if response.status == 200:
                 limits_data = await response.json()
-                print(limits_data)
+                print(limits_data)  # Выводим данные лимитов для проверки
                 return limits_data
             else:
-                logging.error(f"Ошибка при запросе к API WB: {response.status}")
+                # Логируем текст ошибки для дальнейшей диагностики
+                error_text = await response.text()
+                logging.error(f"Ошибка при запросе к API WB: {response.status}, {error_text}")
                 return None
-
-async def compare_limits(update: Update, context: CallbackContext, limits_data):
-    """
-    Функция для сравнения полученных лимитов с запросом пользователя.
-    """
-    user_data = context.user_data.get('request', {})
-    selected_warehouses = user_data.get('warehouses', {})
-    delivery_type_id = user_data.get('delivery_type_id')
-    acceptance_coefficient = int(user_data.get('acceptance_coefficient', 0))
-    delivery_type = user_data.get('delivery_type')
-
-    # Создаем словарь для быстрого поиска склада по ID
-    warehouses_by_id = {wh[5]: wh for wh in warehouses_data}
-
-    filtered_limits = []  # Список для хранения отфильтрованных лимитов
-
-    for limit in limits_data:
-        try:
-            warehouse_id = limit['warehouseID']
-            coefficient = limit['coefficient']
-            box_type_id = limit.get('boxTypeID')  # Получаем ID типа доставки из limits_data, если он есть
-
-            # Проверяем, есть ли информация об этом складе
-            if warehouse_id not in warehouses_by_id:
-                continue
-
-            wh = warehouses_by_id[warehouse_id]
-
-            # Проверяем склады и коэффициент приемки
-            if wh[1] in selected_warehouses and coefficient <= acceptance_coefficient and not -1:
-
-                # Если тип доставки - 'QR поставка коробами', сравниваем по имени
-                if delivery_type == 'delivery_qr_box':
-                    if limit['boxTypeName'] == 'QR поставка коробами':
-                        filtered_limits.append(limit)
-                # Иначе сравниваем по boxTypeID
-                elif box_type_id is not None and delivery_type_id == box_type_id:  
-                    filtered_limits.append(limit)
-
-        except KeyError as e:
-            logging.error(f"Ошибка: отсутствует ключ {e} в данных лимита")
-
-    # Сортируем по коэффициенту (по убыванию)
-    filtered_limits = sorted(filtered_limits, key=lambda x: x['coefficient'], reverse=True)  
-
-    # Отправляем уведомления
-    for limit in filtered_limits:
-        message = (
-            f"Лимит найден! ✅\n"
-            f"🏦 Склад: {limit['warehouseName']}\n"
-            f"📦 Тип приемки: {limit['boxTypeName']}\n"
-            f"💸 Коэффициент: {limit['coefficient']}\n"
-            f"📅Дата: {limit['date']}"
-        )
-        await update.callback_query.message.reply_text(message)
-
 
 
 async def handle_receipt_photo(update: Update, context: CallbackContext):
@@ -974,7 +989,12 @@ async def main_menu(update: Update, context: CallbackContext):
 
 
 def main():
-    application = Application.builder().token("7345975983:AAGMqp0ecosKAS9KENy4MbsHpT2cO3KOY7g").build()
+    job_queue = JobQueue()
+
+    application = (Application.builder().token("7345975983:AAGMqp0ecosKAS9KENy4MbsHpT2cO3KOY7g")
+                   .job_queue(job_queue)
+                   .build()
+                   )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(add_request, pattern='^add_request$'))
